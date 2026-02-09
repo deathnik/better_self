@@ -1,0 +1,2 @@
+flet>=0.80.5
+flet-desktop==0.80.5

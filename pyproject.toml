@@ -1,0 +1,16 @@
+[project]
+name = "daily-journal"
+version = "0.1.0"
+description = "Daily journal app with habits and tasks"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "flet>=0.80.5",
+  "flet-desktop==0.80.5",
+]
+
+[tool.flet]
+org = "com.example"
+product = "DailyJournal"
+company = "Example"
+copyright = "Copyright (C) 2026"
