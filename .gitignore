@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 journal.db
+README.md
+build/
