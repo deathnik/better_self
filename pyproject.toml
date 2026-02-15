@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "flet>=0.80.5",
-  "flet-desktop==0.80.5",
 ]
 
 [tool.flet]
@@ -14,3 +13,23 @@ org = "com.example"
 product = "DailyJournal"
 company = "Example"
 copyright = "Copyright (C) 2026"
+
+[tool.flet.app]
+exclude = [
+  ".venv",
+  "__pycache__",
+  "*.pyc",
+  "*.pyo",
+  "journal.db",
+]
+
+[tool.flet.compile]
+app = true
+packages = true
+
+[tool.flet.cleanup]
+app = true
+
+[tool.flet.android]
+split_per_abi = true
+target_arch = ["arm64-v8a", "armeabi-v7a"]
