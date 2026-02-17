@@ -1125,6 +1125,28 @@ def main(page: ft.Page) -> None:
         refresh_tasks()
         page.update()
 
+    def quick_add_reserved(hours: float) -> None:
+        try:
+            ok, msg = db.add_task(
+                day=selected_day_str(),
+                task_type="reserved",
+                title=f"Reserved time ({hours:g}h)",
+                estimated_hours=hours,
+                start_time="",
+            )
+        except Exception as ex:
+            ok, msg = False, f"Failed to add reserved time: {ex}"
+        show_message(msg, ok)
+        show_task_form_message(msg, ok)
+        refresh_tasks()
+        page.update()
+
+    def quick_add_reserved_30(_: ft.ControlEvent) -> None:
+        quick_add_reserved(0.5)
+
+    def quick_add_reserved_60(_: ft.ControlEvent) -> None:
+        quick_add_reserved(1.0)
+
     task_title_input.on_submit = add_task
     task_estimated_input.on_submit = add_task
     task_time_input.on_submit = add_task
@@ -1244,6 +1266,18 @@ def main(page: ft.Page) -> None:
                                     ft.ElevatedButton(
                                         "Add task for this day",
                                         on_click=add_task,
+                                    ),
+                                ],
+                                wrap=True,
+                                spacing=10,
+                            ),
+                            ft.Row(
+                                controls=[
+                                    ft.OutlinedButton(
+                                        "+ Reserved 0.5h", on_click=quick_add_reserved_30
+                                    ),
+                                    ft.OutlinedButton(
+                                        "+ Reserved 1h", on_click=quick_add_reserved_60
                                     ),
                                 ],
                                 wrap=True,
