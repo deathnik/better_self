@@ -4,10 +4,12 @@ from datetime import date, datetime, timedelta
 from functools import lru_cache
 import json
 from pathlib import Path
+import shutil
 
 import flet as ft
 
-DB_PATH = Path(__file__).with_name("journal.db")
+DB_FILENAME = "journal.db"
+LEGACY_DB_PATH = Path(__file__).with_name(DB_FILENAME)
 QUOTES_SEED_PATH = Path(__file__).with_name("quotes_seed.json")
 
 TASK_TYPE_LABELS = {
@@ -500,8 +502,32 @@ def format_limit_count(task_type: str, count: int) -> str:
     return f"{count}/{limit}"
 
 
+def resolve_db_path(page: ft.Page) -> Path:
+    storage_path = getattr(page, "app_storage_path", "") or ""
+    if isinstance(storage_path, str) and storage_path.strip():
+        target_dir = Path(storage_path)
+    else:
+        target_dir = Path.home() / ".daily_journal"
+
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / DB_FILENAME
+
+        # One-time migration from old bundled location used by earlier versions.
+        if (
+            not target_path.exists()
+            and LEGACY_DB_PATH.exists()
+            and LEGACY_DB_PATH.resolve() != target_path.resolve()
+        ):
+            shutil.copy2(LEGACY_DB_PATH, target_path)
+
+        return target_path
+    except OSError:
+        return LEGACY_DB_PATH
+
+
 def main(page: ft.Page) -> None:
-    db = JournalDB(DB_PATH)
+    db = JournalDB(resolve_db_path(page))
     current_day = date.today()
 
     page.title = "Daily Journal"
