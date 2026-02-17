@@ -505,26 +505,51 @@ def format_limit_count(task_type: str, count: int) -> str:
 
 def resolve_db_path(page: ft.Page) -> Path:
     storage_path = getattr(page, "app_storage_path", "") or ""
+    storage_dir = Path(storage_path) if isinstance(storage_path, str) and storage_path.strip() else None
+
+    platform = getattr(page, "platform", None)
+    is_android = str(platform).lower() == "android"
+    if hasattr(ft, "PagePlatform"):
+        is_android = is_android or platform == ft.PagePlatform.ANDROID
+
+    legacy_candidates = [
+        LEGACY_DB_PATH,
+        Path.home() / ".daily_journal" / DB_FILENAME,
+        Path.cwd() / ".data" / DB_FILENAME,
+        Path("/tmp") / "daily_journal" / DB_FILENAME,
+    ]
+
+    def ensure_target(target_dir: Path) -> Path:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / DB_FILENAME
+        if target_path.exists():
+            return target_path
+
+        for source in legacy_candidates:
+            try:
+                if not source.exists():
+                    continue
+                if source.resolve() == target_path.resolve():
+                    continue
+                shutil.copy2(source, target_path)
+                break
+            except OSError:
+                continue
+        return target_path
+
+    # Android: always prefer app-specific persistent storage.
+    if is_android and storage_dir is not None:
+        return ensure_target(storage_dir)
+
     candidate_dirs: list[Path] = []
-    if isinstance(storage_path, str) and storage_path.strip():
-        candidate_dirs.append(Path(storage_path))
+    if storage_dir is not None:
+        candidate_dirs.append(storage_dir)
     candidate_dirs.append(Path.home() / ".daily_journal")
     candidate_dirs.append(Path.cwd() / ".data")
 
     for target_dir in candidate_dirs:
         try:
-            target_dir.mkdir(parents=True, exist_ok=True)
-            target_path = target_dir / DB_FILENAME
-
-            # One-time migration from old bundled location used by earlier versions.
-            if (
-                not target_path.exists()
-                and LEGACY_DB_PATH.exists()
-                and LEGACY_DB_PATH.resolve() != target_path.resolve()
-            ):
-                shutil.copy2(LEGACY_DB_PATH, target_path)
-
-            return target_path
+            return ensure_target(target_dir)
         except OSError:
             continue
 
