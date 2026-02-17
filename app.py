@@ -561,11 +561,11 @@ def resolve_db_path(page: ft.Page) -> Path:
 
 def main(page: ft.Page) -> None:
     db_path = resolve_db_path(page)
-    print(f"[daily-journal] db_path={db_path}")
+    print(f"[betterself] db_path={db_path}")
     db = JournalDB(db_path)
     current_day = date.today()
 
-    page.title = "Daily Journal"
+    page.title = "BetterSelf"
     page.padding = 20
     page.theme_mode = ft.ThemeMode.LIGHT
     page.window_width = 1100
