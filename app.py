@@ -5,6 +5,7 @@ from functools import lru_cache
 import json
 from pathlib import Path
 import shutil
+import time
 
 import flet as ft
 
@@ -504,30 +505,39 @@ def format_limit_count(task_type: str, count: int) -> str:
 
 def resolve_db_path(page: ft.Page) -> Path:
     storage_path = getattr(page, "app_storage_path", "") or ""
+    candidate_dirs: list[Path] = []
     if isinstance(storage_path, str) and storage_path.strip():
-        target_dir = Path(storage_path)
-    else:
-        target_dir = Path.home() / ".daily_journal"
+        candidate_dirs.append(Path(storage_path))
+    candidate_dirs.append(Path.home() / ".daily_journal")
+    candidate_dirs.append(Path.cwd() / ".data")
 
-    try:
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = target_dir / DB_FILENAME
+    for target_dir in candidate_dirs:
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target_path = target_dir / DB_FILENAME
 
-        # One-time migration from old bundled location used by earlier versions.
-        if (
-            not target_path.exists()
-            and LEGACY_DB_PATH.exists()
-            and LEGACY_DB_PATH.resolve() != target_path.resolve()
-        ):
-            shutil.copy2(LEGACY_DB_PATH, target_path)
+            # One-time migration from old bundled location used by earlier versions.
+            if (
+                not target_path.exists()
+                and LEGACY_DB_PATH.exists()
+                and LEGACY_DB_PATH.resolve() != target_path.resolve()
+            ):
+                shutil.copy2(LEGACY_DB_PATH, target_path)
 
-        return target_path
-    except OSError:
-        return LEGACY_DB_PATH
+            return target_path
+        except OSError:
+            continue
+
+    # Last-resort writable path. Avoid packaged app path because it is replaced on updates.
+    tmp_dir = Path("/tmp") / "daily_journal"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    return tmp_dir / DB_FILENAME
 
 
 def main(page: ft.Page) -> None:
-    db = JournalDB(resolve_db_path(page))
+    db_path = resolve_db_path(page)
+    print(f"[daily-journal] db_path={db_path}")
+    db = JournalDB(db_path)
     current_day = date.today()
 
     page.title = "Daily Journal"
@@ -567,6 +577,9 @@ def main(page: ft.Page) -> None:
     )
     task_form_status = ft.Text(color=ft.Colors.BLUE_GREY_700, size=12)
     task_edit_dialog: ft.AlertDialog | None = None
+    timer_started_at: dict[int, float] = {}
+    timer_accumulated_seconds: dict[int, float] = {}
+    timer_used_task_ids: set[int] = set()
 
     def selected_day_str() -> str:
         return current_day.isoformat()
@@ -630,6 +643,55 @@ def main(page: ft.Page) -> None:
             return parse_hhmm_to_minutes("09:00")
         return parse_hhmm_to_minutes(value)
 
+    def task_elapsed_seconds(task: Task) -> float:
+        stored_seconds = max(0.0, task.spent_hours * 3600.0)
+        base = timer_accumulated_seconds.get(task.id, stored_seconds)
+        if task.id not in timer_accumulated_seconds:
+            timer_accumulated_seconds[task.id] = base
+        elif stored_seconds > base:
+            base = stored_seconds
+            timer_accumulated_seconds[task.id] = base
+        start_ts = timer_started_at.get(task.id)
+        if start_ts is None:
+            return base
+        return max(0.0, base + (time.monotonic() - start_ts))
+
+    def task_elapsed_minutes(task: Task) -> int:
+        return int(task_elapsed_seconds(task) // 60)
+
+    def persist_task_spent(task: Task, is_done: bool) -> tuple[bool, str]:
+        spent_hours = task_elapsed_seconds(task) / 3600.0
+        timer_accumulated_seconds[task.id] = spent_hours * 3600.0
+        return db.update_task(
+            task_id=task.id,
+            day=task.day,
+            task_type=task.task_type,
+            title=task.title,
+            estimated_hours=task.estimated_hours,
+            start_time=task.start_time,
+            spent_hours=spent_hours,
+            is_done=is_done,
+        )
+
+    def toggle_task_timer(task: Task) -> None:
+        task_elapsed_seconds(task)
+        running_since = timer_started_at.get(task.id)
+        if running_since is None:
+            timer_started_at[task.id] = time.monotonic()
+            timer_used_task_ids.add(task.id)
+            show_message(f"Timer started: {task.title}")
+            refresh_tasks()
+            page.update()
+            return
+
+        elapsed = task_elapsed_seconds(task)
+        timer_accumulated_seconds[task.id] = elapsed
+        timer_started_at.pop(task.id, None)
+        ok, msg = persist_task_spent(task, is_done=task.is_done)
+        show_message("Timer paused." if ok else msg, ok)
+        refresh_tasks()
+        page.update()
+
     def open_task_editor(task: Task) -> None:
         nonlocal task_edit_dialog
 
@@ -676,7 +738,7 @@ def main(page: ft.Page) -> None:
                     title=title_field.value,
                     estimated_hours=parse_hours(estimated_field.value),
                     start_time=start_field.value,
-                    spent_hours=task.spent_hours,
+                    spent_hours=task_elapsed_seconds(task) / 3600.0,
                     is_done=bool(done_field.value),
                 )
             except ValueError:
@@ -719,21 +781,23 @@ def main(page: ft.Page) -> None:
         open_dialog(task_edit_dialog)
 
     def mark_task_done(task: Task) -> None:
+        had_timer = task.id in timer_used_task_ids or task_elapsed_seconds(task) > 0
+        if task.id in timer_started_at:
+            elapsed = task_elapsed_seconds(task)
+            timer_accumulated_seconds[task.id] = elapsed
+            timer_started_at.pop(task.id, None)
         if task.is_done:
-            show_message("Task is already done.")
+            if had_timer:
+                show_message(f"Task is already done. Spent: {task_elapsed_minutes(task)} min.")
+            else:
+                show_message("Task is already done.")
             page.update()
             return
-        ok, msg = db.update_task(
-            task_id=task.id,
-            day=task.day,
-            task_type=task.task_type,
-            title=task.title,
-            estimated_hours=task.estimated_hours,
-            start_time=task.start_time,
-            spent_hours=task.spent_hours,
-            is_done=True,
-        )
-        show_message("Task marked done." if ok else msg, ok)
+        ok, msg = persist_task_spent(task, is_done=True)
+        if ok and had_timer:
+            show_message(f"Task marked done. Spent: {task_elapsed_minutes(task)} min.")
+        else:
+            show_message("Task marked done." if ok else msg, ok)
         refresh_tasks()
         page.update()
 
@@ -824,37 +888,106 @@ def main(page: ft.Page) -> None:
         def add_task_block(start_m: int, end_m: int, t: Task, packed: bool) -> None:
             title_prefix = "[DONE] " if t.is_done else ""
             time_suffix = " (auto)" if packed else ""
+            running = t.id in timer_started_at
+            elapsed_minutes = task_elapsed_minutes(t)
+            elapsed_label = f"Spent: {elapsed_minutes} min"
+            if running:
+                elapsed_label = f"{elapsed_label} (running)"
             timeline_column.controls.append(
-                ft.GestureDetector(
-                    on_tap=lambda _, task=t: open_task_editor(task),
-                    on_long_press=lambda _, task=t: mark_task_done(task),
-                    content=ft.Container(
-                        content=ft.Column(
-                            controls=[
-                                ft.Text(
-                                    TASK_TYPE_LABELS.get(t.task_type, "Task"),
-                                    size=12,
-                                    color=ft.Colors.BLUE_GREY_800,
+                ft.Container(
+                    content=ft.Column(
+                        controls=[
+                            ft.GestureDetector(
+                                on_tap=lambda _, task=t: open_task_editor(task),
+                                on_long_press=lambda _, task=t: mark_task_done(task),
+                                content=ft.Container(
+                                    content=ft.Column(
+                                        controls=[
+                                            ft.Text(
+                                                TASK_TYPE_LABELS.get(t.task_type, "Task"),
+                                                size=12,
+                                                color=ft.Colors.BLUE_GREY_800,
+                                            ),
+                                            ft.Text(
+                                                f"{title_prefix}{t.title}",
+                                                weight=ft.FontWeight.BOLD,
+                                            ),
+                                            ft.Text(
+                                                f"{minutes_to_hhmm(start_m)} - {minutes_to_hhmm(end_m)}{time_suffix}"
+                                            ),
+                                        ],
+                                        spacing=2,
+                                    ),
                                 ),
-                                ft.Text(f"{title_prefix}{t.title}", weight=ft.FontWeight.BOLD),
-                                ft.Text(
-                                    f"{minutes_to_hhmm(start_m)} - {minutes_to_hhmm(end_m)}{time_suffix}"
-                                ),
-                            ],
-                            spacing=2,
-                        ),
-                        padding=10,
-                        border=ft.border.all(
-                            1, ft.Colors.GREY_500 if t.is_done else ft.Colors.BLUE_GREY_300
-                        ),
-                        border_radius=8,
-                        bgcolor=(
-                            ft.Colors.GREY_300
-                            if t.is_done
-                            else TASK_TYPE_COLORS.get(t.task_type, ft.Colors.BLUE_100)
-                        ),
+                            ),
+                            ft.Row(
+                                controls=[
+                                    ft.Text(
+                                        elapsed_label,
+                                        size=11,
+                                        color=ft.Colors.BLUE_GREY_700,
+                                        expand=True,
+                                    ),
+                                    ft.OutlinedButton(
+                                        "Pause" if running else "Start",
+                                        on_click=lambda _, task=t: toggle_task_timer(task),
+                                        height=30,
+                                    ),
+                                ],
+                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            ),
+                        ],
+                        spacing=8,
+                    ),
+                    padding=10,
+                    border=ft.border.all(
+                        1, ft.Colors.GREY_500 if t.is_done else ft.Colors.BLUE_GREY_300
+                    ),
+                    border_radius=8,
+                    bgcolor=(
+                        ft.Colors.GREY_300
+                        if t.is_done
+                        else TASK_TYPE_COLORS.get(t.task_type, ft.Colors.BLUE_100)
                     ),
                 )
+            )
+
+        def unplaced_task_chip(t: Task) -> ft.Control:
+            running = t.id in timer_started_at
+            elapsed_minutes = task_elapsed_minutes(t)
+            elapsed_label = f"{elapsed_minutes}m"
+            if running:
+                elapsed_label = f"{elapsed_label} running"
+            return ft.Container(
+                content=ft.Column(
+                    controls=[
+                        ft.GestureDetector(
+                            on_tap=lambda _, task=t: open_task_editor(task),
+                            on_long_press=lambda _, task=t: mark_task_done(task),
+                            content=ft.Text(
+                                f"{TASK_TYPE_LABELS.get(t.task_type, 'Task')}: {t.title}",
+                                size=11,
+                                color=ft.Colors.BLUE_GREY_900,
+                            ),
+                        ),
+                        ft.Row(
+                            controls=[
+                                ft.Text(elapsed_label, size=10, color=ft.Colors.BLUE_GREY_700),
+                                ft.TextButton(
+                                    "Pause" if running else "Start",
+                                    on_click=lambda _, task=t: toggle_task_timer(task),
+                                ),
+                            ],
+                            spacing=4,
+                        ),
+                    ],
+                    spacing=2,
+                    tight=True,
+                ),
+                padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                border=ft.border.all(1, ft.Colors.BLUE_GREY_200),
+                border_radius=8,
+                bgcolor=ft.Colors.BLUE_GREY_50,
             )
 
         if not intervals:
@@ -891,21 +1024,7 @@ def main(page: ft.Page) -> None:
             timeline_column.controls.append(
                 ft.Row(
                     controls=[
-                        ft.GestureDetector(
-                            on_tap=lambda _, task=t: open_task_editor(task),
-                            on_long_press=lambda _, task=t: mark_task_done(task),
-                            content=ft.Container(
-                                content=ft.Text(
-                                    f"{TASK_TYPE_LABELS.get(t.task_type, 'Task')}: {t.title}",
-                                    size=11,
-                                    color=ft.Colors.BLUE_GREY_900,
-                                ),
-                                padding=ft.padding.symmetric(horizontal=8, vertical=4),
-                                border=ft.border.all(1, ft.Colors.BLUE_GREY_200),
-                                border_radius=999,
-                                bgcolor=ft.Colors.BLUE_GREY_50,
-                            ),
-                        )
+                        unplaced_task_chip(t)
                         for t in not_placed_tasks
                     ],
                     wrap=True,
