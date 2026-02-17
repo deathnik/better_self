@@ -1,11 +1,14 @@
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from functools import lru_cache
+import json
 from pathlib import Path
 
 import flet as ft
 
 DB_PATH = Path(__file__).with_name("journal.db")
+QUOTES_SEED_PATH = Path(__file__).with_name("quotes_seed.json")
 
 TASK_TYPE_LABELS = {
     "focus": "Focus of the day",
@@ -32,6 +35,36 @@ TASK_TYPE_COLORS = {
     "pleasure": ft.Colors.PINK_200,
     "reserved": ft.Colors.YELLOW_200,
 }
+
+DEFAULT_DAILY_QUOTE = ("Keep going.", "Unknown")
+
+
+@lru_cache(maxsize=1)
+def load_daily_quotes_from_seed(total_days: int = 365) -> list[tuple[str, str]]:
+    try:
+        raw = json.loads(QUOTES_SEED_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return [DEFAULT_DAILY_QUOTE] * total_days
+
+    if not isinstance(raw, list):
+        return [DEFAULT_DAILY_QUOTE] * total_days
+
+    by_day: dict[int, tuple[str, str]] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        day = item.get("day_of_year")
+        quote = item.get("quote")
+        author = item.get("author")
+        if not isinstance(day, int) or day < 1 or day > total_days:
+            continue
+        if not isinstance(quote, str) or not quote.strip():
+            continue
+        if not isinstance(author, str) or not author.strip():
+            continue
+        by_day[day] = (quote.strip(), author.strip())
+
+    return [by_day.get(day, DEFAULT_DAILY_QUOTE) for day in range(1, total_days + 1)]
 
 
 @dataclass
@@ -104,6 +137,15 @@ class JournalDB:
             )
             """
         )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS quotes (
+                day_of_year INTEGER PRIMARY KEY,
+                quote TEXT NOT NULL,
+                author TEXT NOT NULL
+            )
+            """
+        )
 
         columns = self._column_names("tasks")
         if "task_type" not in columns:
@@ -150,6 +192,7 @@ class JournalDB:
             VALUES ('day_start', '09:00')
             """
         )
+        self._seed_daily_quotes()
 
         self.conn.commit()
 
@@ -177,6 +220,39 @@ class JournalDB:
             (key, value),
         )
         self.conn.commit()
+
+    def _seed_daily_quotes(self) -> None:
+        existing = self.conn.execute("SELECT COUNT(*) AS c FROM quotes").fetchone()
+        quote_count = int(existing["c"]) if existing is not None else 0
+        if quote_count == 365:
+            return
+
+        daily_quotes = load_daily_quotes_from_seed(365)
+        self.conn.execute("DELETE FROM quotes")
+        self.conn.executemany(
+            """
+            INSERT INTO quotes(day_of_year, quote, author)
+            VALUES (?, ?, ?)
+            """,
+            [(idx, quote, author) for idx, (quote, author) in enumerate(daily_quotes, start=1)],
+        )
+
+    def get_quote_for_date(self, d: date) -> tuple[str, str]:
+        day_of_year = min(d.timetuple().tm_yday, 365)
+        row = self.conn.execute(
+            """
+            SELECT quote, author
+            FROM quotes
+            WHERE day_of_year = ?
+            """,
+            (day_of_year,),
+        ).fetchone()
+        if row is None:
+            fallback_quote, fallback_author = load_daily_quotes_from_seed(365)[
+                day_of_year - 1
+            ]
+            return fallback_quote, fallback_author
+        return str(row["quote"]), str(row["author"])
 
     def list_habits(self) -> list[Habit]:
         rows = self.conn.execute("SELECT id, name FROM habits ORDER BY id").fetchall()
@@ -860,6 +936,60 @@ def main(page: ft.Page) -> None:
         refresh_tasks()
         page.update()
 
+    quote_dialog: ft.AlertDialog | None = None
+
+    def open_dialog(dialog: ft.AlertDialog) -> None:
+        if hasattr(page, "open"):
+            page.open(dialog)
+            return
+        if hasattr(page, "show_dialog"):
+            page.show_dialog(dialog)
+            return
+        page.dialog = dialog
+        dialog.open = True
+        page.update()
+
+    def close_dialog(dialog: ft.AlertDialog) -> None:
+        if hasattr(page, "close"):
+            page.close(dialog)
+            return
+        dialog.open = False
+        if hasattr(page, "dialog"):
+            page.dialog = None
+        page.update()
+
+    def dismiss_daily_quote(_: ft.ControlEvent | None = None) -> None:
+        nonlocal quote_dialog
+        today_str = date.today().isoformat()
+        db.set_setting("quote_dismissed_day", today_str)
+        if quote_dialog is not None:
+            close_dialog(quote_dialog)
+            quote_dialog = None
+
+    def show_daily_quote_if_needed() -> None:
+        nonlocal quote_dialog
+        today = date.today()
+        today_str = today.isoformat()
+        dismissed_day = db.get_setting("quote_dismissed_day", "")
+        if dismissed_day == today_str:
+            return
+
+        quote, author = db.get_quote_for_date(today)
+        quote_dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Quote of the Day"),
+            content=ft.Column(
+                tight=True,
+                controls=[
+                    ft.Text(f'"{quote}"', italic=True, selectable=True),
+                    ft.Text(f"- {author}", weight=ft.FontWeight.W_600),
+                ],
+            ),
+            actions=[ft.ElevatedButton("Start day", on_click=dismiss_daily_quote)],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        open_dialog(quote_dialog)
+
     page.add(
         ft.Column(
             controls=[
@@ -964,6 +1094,7 @@ def main(page: ft.Page) -> None:
     )
 
     refresh_all()
+    show_daily_quote_if_needed()
     page.update()
 
 
