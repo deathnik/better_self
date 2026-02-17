@@ -541,6 +541,7 @@ def main(page: ft.Page) -> None:
         value=db.get_setting("day_start", "09:00"),
     )
     task_form_status = ft.Text(color=ft.Colors.BLUE_GREY_700, size=12)
+    task_edit_dialog: ft.AlertDialog | None = None
 
     def selected_day_str() -> str:
         return current_day.isoformat()
@@ -777,47 +778,55 @@ def main(page: ft.Page) -> None:
                 task_list_column.controls.append(ft.Divider(height=12))
                 continue
 
-            for t in group_tasks:
+            def open_task_editor(task: Task) -> None:
+                nonlocal task_edit_dialog
+
+                if task_edit_dialog is not None:
+                    close_dialog(task_edit_dialog)
+                    task_edit_dialog = None
+
                 type_field = ft.Dropdown(
-                    value=t.task_type,
-                    width=210,
+                    label="Type",
+                    value=task.task_type,
+                    width=220,
                     options=[
                         ft.dropdown.Option(key=k, text=TASK_TYPE_LABELS[k])
                         for k in TASK_TYPE_ORDER
                     ],
                 )
-                title = ft.TextField(value=t.title, width=320)
-                estimated = ft.TextField(value=f"{t.estimated_hours:g}", width=130)
-                start = ft.TextField(value=t.start_time, width=130)
-                done = ft.Checkbox(value=t.is_done)
-                save_btn = ft.ElevatedButton("Save")
-                delete_btn = ft.OutlinedButton("Delete")
+                title_field = ft.TextField(label="Task name", value=task.title, width=360)
+                estimated_field = ft.TextField(
+                    label="Estimated length (h)",
+                    value=f"{task.estimated_hours:g}",
+                    width=220,
+                )
+                start_field = ft.TextField(
+                    label="Start time (HH:MM)", value=task.start_time, width=220
+                )
+                done_field = ft.Checkbox(label="Done", value=task.is_done)
 
-                def save_task(
-                    _: ft.ControlEvent,
-                    task_id: int = t.id,
-                    task_day: str = t.day,
-                    type_f: ft.Dropdown = type_field,
-                    title_f: ft.TextField = title,
-                    estimated_f: ft.TextField = estimated,
-                    start_f: ft.TextField = start,
-                    spent_hours_value: float = t.spent_hours,
-                    done_f: ft.Checkbox = done,
-                ) -> None:
-                    if not validate_time_or_empty(start_f.value):
+                def dismiss_editor(_: ft.ControlEvent | None = None) -> None:
+                    nonlocal task_edit_dialog
+                    if task_edit_dialog is not None:
+                        close_dialog(task_edit_dialog)
+                        task_edit_dialog = None
+
+                def save_task(_: ft.ControlEvent) -> None:
+                    if not validate_time_or_empty(start_field.value):
                         show_message("Start time must use HH:MM (24-hour).", False)
                         page.update()
                         return
+
                     try:
                         ok, msg = db.update_task(
-                            task_id=task_id,
-                            day=task_day,
-                            task_type=type_f.value or "small",
-                            title=title_f.value,
-                            estimated_hours=parse_hours(estimated_f.value),
-                            start_time=start_f.value,
-                            spent_hours=spent_hours_value,
-                            is_done=bool(done_f.value),
+                            task_id=task.id,
+                            day=task.day,
+                            task_type=type_field.value or "small",
+                            title=title_field.value,
+                            estimated_hours=parse_hours(estimated_field.value),
+                            start_time=start_field.value,
+                            spent_hours=task.spent_hours,
+                            is_done=bool(done_field.value),
                         )
                     except ValueError:
                         show_message("Estimated/spent hours must be numeric.", False)
@@ -825,31 +834,112 @@ def main(page: ft.Page) -> None:
                         return
 
                     show_message(msg, ok)
+                    if ok:
+                        dismiss_editor()
                     refresh_tasks()
                     page.update()
 
-                def remove_task(_: ft.ControlEvent, task_id: int = t.id) -> None:
-                    db.delete_task(task_id)
+                def remove_task(_: ft.ControlEvent) -> None:
+                    db.delete_task(task.id)
+                    dismiss_editor()
                     show_message("Task deleted.")
                     refresh_tasks()
                     page.update()
 
-                save_btn.on_click = save_task
-                delete_btn.on_click = remove_task
-
-                task_list_column.controls.append(
-                    ft.Row(
+                task_edit_dialog = ft.AlertDialog(
+                    modal=True,
+                    title=ft.Text("Edit task"),
+                    content=ft.Column(
+                        tight=True,
                         controls=[
                             type_field,
-                            title,
-                            estimated,
-                            start,
-                            done,
-                            save_btn,
-                            delete_btn,
+                            title_field,
+                            ft.Row(controls=[estimated_field, start_field], wrap=True),
+                            done_field,
                         ],
-                        wrap=True,
-                        alignment=ft.MainAxisAlignment.START,
+                    ),
+                    actions=[
+                        ft.TextButton("Cancel", on_click=dismiss_editor),
+                        ft.OutlinedButton("Delete", on_click=remove_task),
+                        ft.ElevatedButton("Save", on_click=save_task),
+                    ],
+                    actions_alignment=ft.MainAxisAlignment.END,
+                )
+                open_dialog(task_edit_dialog)
+
+            def mark_task_done(task: Task) -> None:
+                if task.is_done:
+                    show_message("Task is already done.")
+                    page.update()
+                    return
+                ok, msg = db.update_task(
+                    task_id=task.id,
+                    day=task.day,
+                    task_type=task.task_type,
+                    title=task.title,
+                    estimated_hours=task.estimated_hours,
+                    start_time=task.start_time,
+                    spent_hours=task.spent_hours,
+                    is_done=True,
+                )
+                show_message("Task marked done." if ok else msg, ok)
+                refresh_tasks()
+                page.update()
+
+            for t in group_tasks:
+                start_text = t.start_time if t.start_time else "No start time"
+                estimated_text = (
+                    f"{t.estimated_hours:g}h" if t.estimated_hours > 0 else "No estimate"
+                )
+                task_list_column.controls.append(
+                    ft.GestureDetector(
+                        on_tap=lambda _, task=t: open_task_editor(task),
+                        on_long_press=lambda _, task=t: mark_task_done(task),
+                        content=ft.Container(
+                            content=ft.Row(
+                                controls=[
+                                    ft.Column(
+                                        controls=[
+                                            ft.Text(
+                                                t.title,
+                                                weight=ft.FontWeight.BOLD,
+                                                color=(
+                                                    ft.Colors.BLUE_GREY_500
+                                                    if t.is_done
+                                                    else ft.Colors.BLUE_GREY_900
+                                                ),
+                                            ),
+                                            ft.Text(
+                                                f"{TASK_TYPE_LABELS.get(t.task_type, 'Task')} | {estimated_text} | {start_text}",
+                                                size=12,
+                                                color=ft.Colors.BLUE_GREY_700,
+                                            ),
+                                        ],
+                                        spacing=2,
+                                        expand=True,
+                                    ),
+                                    ft.Text(
+                                        "DONE" if t.is_done else "OPEN",
+                                        weight=ft.FontWeight.W_600,
+                                        color=(
+                                            ft.Colors.GREEN_700
+                                            if t.is_done
+                                            else ft.Colors.BLUE_GREY_700
+                                        ),
+                                    ),
+                                ],
+                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            ),
+                            padding=10,
+                            border=ft.border.all(1, ft.Colors.GREY_300),
+                            border_radius=8,
+                            bgcolor=(
+                                ft.Colors.GREY_200
+                                if t.is_done
+                                else TASK_TYPE_COLORS.get(t.task_type, ft.Colors.BLUE_50)
+                            ),
+                        ),
                     )
                 )
 
@@ -1053,7 +1143,7 @@ def main(page: ft.Page) -> None:
                                     ),
                                     task_form_status,
                                     ft.Text(
-                                        "Type | Name | Estimated (h) | Start | Done",
+                                        "Short tap: edit task | Long press: mark done",
                                         size=12,
                                         color=ft.Colors.BLUE_GREY_700,
                                     ),
