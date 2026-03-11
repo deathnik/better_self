@@ -17,7 +17,7 @@ dev = [
 [tool.flet]
 org = "com.deathnik.betterself"
 product = "BetterSelf"
-company = "Example"
+company = "Deathnik&&Codex"
 copyright = "Copyright (C) 2026"
 
 [tool.flet.app]
