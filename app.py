@@ -5,6 +5,7 @@ from functools import lru_cache
 import json
 from pathlib import Path
 import shutil
+import tempfile
 import time
 
 import flet as ft
@@ -574,6 +575,7 @@ def main(page: ft.Page) -> None:
 
     date_label = ft.Text(size=22, weight=ft.FontWeight.BOLD)
     status_text = ft.Text(color=ft.Colors.BLUE_GREY_700)
+    settings_status_text = ft.Text(color=ft.Colors.BLUE_GREY_700)
 
     habit_column = ft.Column(spacing=8)
     timeline_column = ft.Column(spacing=8)
@@ -605,6 +607,10 @@ def main(page: ft.Page) -> None:
     timer_started_at: dict[int, float] = {}
     timer_accumulated_seconds: dict[int, float] = {}
     timer_used_task_ids: set[int] = set()
+    is_settings_open = False
+    settings_screen: ft.Control | None = None
+    main_screen: ft.Control | None = None
+    top_right_button = ft.IconButton(icon=ft.Icons.SETTINGS, tooltip="Settings")
 
     def selected_day_str() -> str:
         return current_day.isoformat()
@@ -612,6 +618,10 @@ def main(page: ft.Page) -> None:
     def show_message(message: str, ok: bool = True) -> None:
         status_text.value = message
         status_text.color = ft.Colors.GREEN_700 if ok else ft.Colors.RED_700
+
+    def show_settings_message(message: str, ok: bool = True) -> None:
+        settings_status_text.value = message
+        settings_status_text.color = ft.Colors.GREEN_700 if ok else ft.Colors.RED_700
 
     def show_task_form_message(message: str, ok: bool = True) -> None:
         task_form_status.value = message
@@ -1064,6 +1074,7 @@ def main(page: ft.Page) -> None:
 
     def refresh_all() -> None:
         date_label.value = datetime.strftime(current_day, "%A, %B %d, %Y")
+        day_start_input.value = db.get_setting("day_start", "09:00")
         refresh_habits()
         refresh_tasks()
         refresh_stats()
@@ -1163,6 +1174,225 @@ def main(page: ft.Page) -> None:
         refresh_tasks()
         page.update()
 
+    def create_sqlite_backup(target_path: Path) -> None:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(target_path) as backup_conn:
+            db.conn.backup(backup_conn)
+
+    def create_sqlite_backup_bytes() -> bytes:
+        with tempfile.NamedTemporaryFile(
+            prefix="betterself_backup_",
+            suffix=".db",
+            delete=False,
+        ) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+        try:
+            create_sqlite_backup(tmp_path)
+            return tmp_path.read_bytes()
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    def validate_backup_file(backup_path: Path) -> tuple[bool, str]:
+        if not backup_path.exists():
+            return False, "Selected file does not exist."
+
+        try:
+            with sqlite3.connect(backup_path) as conn:
+                rows = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+                table_names = {str(row[0]) for row in rows}
+        except sqlite3.Error:
+            return False, "Selected file is not a valid SQLite backup."
+
+        required = {"habits", "habit_checks", "tasks", "settings", "quotes"}
+        missing = sorted(required - table_names)
+        if missing:
+            return False, f"Backup missing required tables: {', '.join(missing)}."
+        return True, ""
+
+    def restore_backup_from_path(path_value: str) -> tuple[bool, str]:
+        nonlocal db
+        source = Path(path_value.strip())
+        valid, reason = validate_backup_file(source)
+        if not valid:
+            return False, reason
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safety_copy = db_path.with_name(f"{db_path.stem}_before_restore_{timestamp}.db")
+
+        try:
+            db.conn.commit()
+            db.conn.close()
+            if db_path.exists():
+                shutil.copy2(db_path, safety_copy)
+            shutil.copy2(source, db_path)
+            db = JournalDB(db_path)
+        except (OSError, sqlite3.Error) as ex:
+            try:
+                if safety_copy.exists():
+                    shutil.copy2(safety_copy, db_path)
+            except OSError:
+                pass
+            db = JournalDB(db_path)
+            return False, f"Restore failed: {ex}"
+
+        refresh_all()
+        return True, f"Backup restored from {source.name}"
+
+    def share_backup_file(path: Path) -> tuple[bool, str]:
+        share_method = getattr(page, "share", None)
+        if callable(share_method):
+            for kwargs in (
+                {"files": [str(path)], "title": "BetterSelf backup"},
+                {"files": [str(path)]},
+            ):
+                try:
+                    share_method(**kwargs)
+                    return True, "Share dialog opened."
+                except TypeError:
+                    continue
+                except Exception as ex:
+                    return False, f"Share failed: {ex}"
+            try:
+                share_method(str(path))
+                return True, "Share dialog opened."
+            except Exception:
+                pass
+
+        try:
+            page.set_clipboard(str(path))
+        except Exception:
+            return False, f"Share is unavailable on this platform. Backup path: {path}"
+        return True, f"Share is unavailable. Backup path copied: {path}"
+
+    backup_pick_file = ft.FilePicker()
+    backup_save_file = ft.FilePicker()
+    page.services.extend([backup_pick_file, backup_save_file])
+
+    async def open_restore_picker(_: ft.ControlEvent) -> None:
+        selected_files = await backup_pick_file.pick_files(
+            allow_multiple=False,
+            dialog_title="Select BetterSelf backup file",
+            with_data=True,
+        )
+        if not selected_files:
+            show_settings_message("Restore canceled.", False)
+            page.update()
+            return
+        selected_file = selected_files[0]
+        selected_path = selected_file.path
+
+        if selected_path:
+            ok, msg = restore_backup_from_path(selected_path)
+            show_settings_message(msg, ok)
+            if ok:
+                show_message("Backup restored.")
+            page.update()
+            return
+
+        selected_bytes = getattr(selected_file, "bytes", None)
+        if not selected_bytes:
+            show_settings_message(
+                "Could not read selected backup data from picker.",
+                False,
+            )
+            page.update()
+            return
+
+        with tempfile.NamedTemporaryFile(
+            prefix="betterself_restore_",
+            suffix=".db",
+            delete=False,
+        ) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+            tmp_file.write(selected_bytes)
+
+        try:
+            ok, msg = restore_backup_from_path(str(tmp_path))
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+        show_settings_message(msg, ok)
+        if ok:
+            show_message("Backup restored.")
+        page.update()
+
+    async def create_backup_on_filesystem(_: ft.ControlEvent) -> None:
+        try:
+            backup_bytes = create_sqlite_backup_bytes()
+        except (OSError, sqlite3.Error) as ex:
+            show_settings_message(f"Failed to create backup: {ex}", False)
+            page.update()
+            return
+
+        selected_path = await backup_save_file.save_file(
+            dialog_title="Save BetterSelf backup",
+            file_name=f"betterself_backup_{date.today().isoformat()}.db",
+            src_bytes=backup_bytes,
+        )
+        if not selected_path:
+            show_settings_message("Backup export canceled.", False)
+            page.update()
+            return
+
+        saved_path = Path(selected_path)
+        if saved_path.exists():
+            show_settings_message(f"Backup saved to {saved_path}")
+        else:
+            show_settings_message("Backup saved.")
+        page.update()
+
+    async def create_and_share_backup(_: ft.ControlEvent) -> None:
+        try:
+            backup_bytes = create_sqlite_backup_bytes()
+        except (OSError, sqlite3.Error) as ex:
+            show_settings_message(f"Failed to create backup: {ex}", False)
+            page.update()
+            return
+
+        selected_path = await backup_save_file.save_file(
+            dialog_title="Save BetterSelf backup",
+            file_name=f"betterself_backup_{date.today().isoformat()}.db",
+            src_bytes=backup_bytes,
+        )
+        if not selected_path:
+            show_settings_message("Backup export canceled.", False)
+            page.update()
+            return
+
+        saved_path = Path(selected_path)
+        if not saved_path.exists():
+            show_settings_message("Backup saved. Share is unavailable in this mode.")
+            page.update()
+            return
+
+        ok, msg = share_backup_file(saved_path)
+        show_settings_message(msg, ok)
+        page.update()
+
+    def set_settings_mode(opened: bool) -> None:
+        nonlocal is_settings_open
+        is_settings_open = opened
+        if main_screen is not None:
+            main_screen.visible = not opened
+        if settings_screen is not None:
+            settings_screen.visible = opened
+        top_right_button.icon = ft.Icons.CLOSE if opened else ft.Icons.SETTINGS
+        top_right_button.tooltip = "Close settings" if opened else "Settings"
+        page.update()
+
+    def toggle_settings(_: ft.ControlEvent) -> None:
+        set_settings_mode(not is_settings_open)
+
+    top_right_button.on_click = toggle_settings
+
     quote_dialog: ft.AlertDialog | None = None
 
     def open_dialog(dialog: ft.AlertDialog) -> None:
@@ -1217,91 +1447,156 @@ def main(page: ft.Page) -> None:
         )
         open_dialog(quote_dialog)
 
+    main_screen = ft.Column(
+        controls=[
+            ft.Row(
+                controls=[
+                    ft.ElevatedButton("<", on_click=go_prev_day),
+                    date_label,
+                    ft.ElevatedButton(">", on_click=go_next_day),
+                    day_start_input,
+                    ft.ElevatedButton("Save day start", on_click=save_day_start),
+                ],
+                alignment=ft.MainAxisAlignment.START,
+            ),
+            status_text,
+            ft.Divider(),
+            ft.Text("Daily Habits", size=20, weight=ft.FontWeight.BOLD),
+            ft.Row(
+                controls=[
+                    add_habit_input,
+                    ft.ElevatedButton("Add habit", on_click=add_habit),
+                ],
+                alignment=ft.MainAxisAlignment.START,
+            ),
+            habit_column,
+            ft.Divider(),
+            ft.Text("Tasks", size=20, weight=ft.FontWeight.BOLD),
+            ft.Container(
+                content=ft.Column(
+                    controls=[
+                        ft.Text(
+                            "Add task for selected day",
+                            size=14,
+                            weight=ft.FontWeight.W_600,
+                        ),
+                        ft.Row(
+                            controls=[
+                                add_task_type,
+                                task_title_input,
+                            ],
+                            wrap=True,
+                            spacing=10,
+                        ),
+                        ft.Row(
+                            controls=[
+                                task_estimated_input,
+                                task_time_input,
+                                ft.ElevatedButton(
+                                    "Add task for this day",
+                                    on_click=add_task,
+                                ),
+                            ],
+                            wrap=True,
+                            spacing=10,
+                        ),
+                        ft.Row(
+                            controls=[
+                                ft.OutlinedButton(
+                                    "+ Reserved 0.5h", on_click=quick_add_reserved_30
+                                ),
+                                ft.OutlinedButton(
+                                    "+ Reserved 1h", on_click=quick_add_reserved_60
+                                ),
+                            ],
+                            wrap=True,
+                            spacing=10,
+                        ),
+                        task_form_status,
+                        ft.Divider(height=14),
+                        ft.Text(
+                            "Time Line",
+                            size=18,
+                            weight=ft.FontWeight.BOLD,
+                        ),
+                        timeline_column,
+                    ]
+                ),
+                border=ft.border.all(1, ft.Colors.GREY_300),
+                border_radius=10,
+                padding=12,
+            ),
+            ft.Divider(),
+            ft.Text("Habit Completion Stats", size=20, weight=ft.FontWeight.BOLD),
+            week_stat,
+            month_stat,
+            year_stat,
+        ]
+    )
+
+    settings_screen = ft.Column(
+        visible=False,
+        controls=[
+            ft.Text("Settings", size=24, weight=ft.FontWeight.BOLD),
+            ft.Text(
+                "Backup and restore your data.",
+                color=ft.Colors.BLUE_GREY_700,
+            ),
+            ft.Container(
+                content=ft.Column(
+                    controls=[
+                        ft.Text("Backups", size=18, weight=ft.FontWeight.W_600),
+                        ft.Text(
+                            "Create a backup file, share it, or restore from an existing file.",
+                            size=13,
+                            color=ft.Colors.BLUE_GREY_700,
+                        ),
+                        ft.Row(
+                            wrap=True,
+                            spacing=10,
+                            run_spacing=10,
+                            controls=[
+                                ft.ElevatedButton(
+                                    "Load backup",
+                                    icon=ft.Icons.UPLOAD_FILE,
+                                    on_click=open_restore_picker,
+                                ),
+                                ft.ElevatedButton(
+                                    "Create backup",
+                                    icon=ft.Icons.DOWNLOAD,
+                                    on_click=create_backup_on_filesystem,
+                                ),
+                                ft.OutlinedButton(
+                                    "Create & share",
+                                    icon=ft.Icons.SHARE,
+                                    on_click=create_and_share_backup,
+                                ),
+                            ],
+                        ),
+                        settings_status_text,
+                    ],
+                    spacing=10,
+                ),
+                border=ft.border.all(1, ft.Colors.GREY_300),
+                border_radius=10,
+                padding=12,
+            ),
+        ],
+    )
+
     page.add(
         ft.Column(
             controls=[
                 ft.Row(
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     controls=[
-                        ft.ElevatedButton("<", on_click=go_prev_day),
-                        date_label,
-                        ft.ElevatedButton(">", on_click=go_next_day),
-                        day_start_input,
-                        ft.ElevatedButton("Save day start", on_click=save_day_start),
+                        ft.Text("BetterSelf", size=24, weight=ft.FontWeight.BOLD),
+                        top_right_button,
                     ],
-                    alignment=ft.MainAxisAlignment.START,
                 ),
-                status_text,
-                ft.Divider(),
-                ft.Text("Daily Habits", size=20, weight=ft.FontWeight.BOLD),
-                ft.Row(
-                    controls=[
-                        add_habit_input,
-                        ft.ElevatedButton("Add habit", on_click=add_habit),
-                    ],
-                    alignment=ft.MainAxisAlignment.START,
-                ),
-                habit_column,
-                ft.Divider(),
-                ft.Text("Tasks", size=20, weight=ft.FontWeight.BOLD),
-                ft.Container(
-                    content=ft.Column(
-                        controls=[
-                            ft.Text(
-                                "Add task for selected day",
-                                size=14,
-                                weight=ft.FontWeight.W_600,
-                            ),
-                            ft.Row(
-                                controls=[
-                                    add_task_type,
-                                    task_title_input,
-                                ],
-                                wrap=True,
-                                spacing=10,
-                            ),
-                            ft.Row(
-                                controls=[
-                                    task_estimated_input,
-                                    task_time_input,
-                                    ft.ElevatedButton(
-                                        "Add task for this day",
-                                        on_click=add_task,
-                                    ),
-                                ],
-                                wrap=True,
-                                spacing=10,
-                            ),
-                            ft.Row(
-                                controls=[
-                                    ft.OutlinedButton(
-                                        "+ Reserved 0.5h", on_click=quick_add_reserved_30
-                                    ),
-                                    ft.OutlinedButton(
-                                        "+ Reserved 1h", on_click=quick_add_reserved_60
-                                    ),
-                                ],
-                                wrap=True,
-                                spacing=10,
-                            ),
-                            task_form_status,
-                            ft.Divider(height=14),
-                            ft.Text(
-                                "Time Line",
-                                size=18,
-                                weight=ft.FontWeight.BOLD,
-                            ),
-                            timeline_column,
-                        ]
-                    ),
-                    border=ft.border.all(1, ft.Colors.GREY_300),
-                    border_radius=10,
-                    padding=12,
-                ),
-                ft.Divider(),
-                ft.Text("Habit Completion Stats", size=20, weight=ft.FontWeight.BOLD),
-                week_stat,
-                month_stat,
-                year_stat,
+                main_screen,
+                settings_screen,
             ]
         )
     )
