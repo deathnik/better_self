@@ -1230,13 +1230,13 @@ def main(page: ft.Page) -> None:
 
     def save_day_start(_: ft.ControlEvent) -> None:
         if not validate_time_or_empty(day_start_input.value):
-            show_message("Day start must use HH:MM (24-hour).", False)
+            show_settings_message("Day start must use HH:MM (24-hour).", False)
             page.update()
             return
         new_value = day_start_input.value.strip() or "09:00"
         db.set_setting("day_start", new_value)
         day_start_input.value = new_value
-        show_message("Day start saved.")
+        show_settings_message("Day start saved.")
         refresh_tasks()
         page.update()
 
@@ -1468,8 +1468,6 @@ def main(page: ft.Page) -> None:
                     ft.ElevatedButton("<", on_click=go_prev_day),
                     date_label,
                     ft.ElevatedButton(">", on_click=go_next_day),
-                    day_start_input,
-                    ft.ElevatedButton("Save day start", on_click=save_day_start),
                 ],
                 alignment=ft.MainAxisAlignment.START,
             ),
@@ -1553,8 +1551,37 @@ def main(page: ft.Page) -> None:
         controls=[
             ft.Text("Settings", size=24, weight=ft.FontWeight.BOLD),
             ft.Text(
-                "Backup and restore your data.",
+                "Manage app preferences and backups.",
                 color=ft.Colors.BLUE_GREY_700,
+            ),
+            ft.Container(
+                content=ft.Column(
+                    controls=[
+                        ft.Text("Schedule", size=18, weight=ft.FontWeight.W_600),
+                        ft.Text(
+                            "Set the default day start used for timeline planning.",
+                            size=13,
+                            color=ft.Colors.BLUE_GREY_700,
+                        ),
+                        ft.Row(
+                            wrap=True,
+                            spacing=10,
+                            run_spacing=10,
+                            controls=[
+                                day_start_input,
+                                ft.ElevatedButton(
+                                    "Save day start",
+                                    icon=ft.Icons.SAVE,
+                                    on_click=save_day_start,
+                                ),
+                            ],
+                        ),
+                    ],
+                    spacing=10,
+                ),
+                border=ft.border.all(1, ft.Colors.GREY_300),
+                border_radius=10,
+                padding=12,
             ),
             ft.Container(
                 content=ft.Column(
