@@ -12,7 +12,11 @@ This file defines how AI coding agents should operate in this repository.
 - Always present a short plan before any change.
 - Wait for explicit user `ok` before any file edit or implementation command.
 - Run `ruff check .` and `pytest` after changes.
-- Log features into `UserStories.md`.
+- Log only user-experience-facing features into `UserStories.md`.
+
+## UserStories Logging Scope
+- Include: new user-visible features, UX changes, behavior changes users can notice.
+- Exclude: dependency updates, tooling/lint/test setup, refactors, internal cleanup, infra-only changes.
 
 ## Project Snapshot
 - App type: Python + Flet daily journal app for use across Android, iOS and desktop.
