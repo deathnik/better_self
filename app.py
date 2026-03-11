@@ -41,6 +41,7 @@ TASK_TYPE_COLORS = {
 }
 
 DEFAULT_DAILY_QUOTE = ("Keep going.", "Unknown")
+BACKUP_REQUIRED_TABLES = {"habits", "habit_checks", "tasks", "settings", "quotes"}
 
 
 @lru_cache(maxsize=1)
@@ -558,6 +559,71 @@ def resolve_db_path(page: ft.Page) -> Path:
     tmp_dir = Path("/tmp") / "daily_journal"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     return tmp_dir / DB_FILENAME
+
+
+def create_sqlite_backup(conn: sqlite3.Connection, target_path: Path) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(target_path) as backup_conn:
+        conn.backup(backup_conn)
+
+
+def create_sqlite_backup_bytes(conn: sqlite3.Connection) -> bytes:
+    with tempfile.NamedTemporaryFile(
+        prefix="betterself_backup_",
+        suffix=".db",
+        delete=False,
+    ) as tmp_file:
+        tmp_path = Path(tmp_file.name)
+    try:
+        create_sqlite_backup(conn, tmp_path)
+        return tmp_path.read_bytes()
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+def validate_backup_file(backup_path: Path) -> tuple[bool, str]:
+    if not backup_path.exists():
+        return False, "Selected file does not exist."
+
+    try:
+        with sqlite3.connect(backup_path) as conn:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+            table_names = {str(row[0]) for row in rows}
+    except sqlite3.Error:
+        return False, "Selected file is not a valid SQLite backup."
+
+    missing = sorted(BACKUP_REQUIRED_TABLES - table_names)
+    if missing:
+        return False, f"Backup missing required tables: {', '.join(missing)}."
+    return True, ""
+
+
+def restore_backup_file_to_path(source: Path, db_path: Path) -> tuple[bool, str]:
+    valid, reason = validate_backup_file(source)
+    if not valid:
+        return False, reason
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safety_copy = db_path.with_name(f"{db_path.stem}_before_restore_{timestamp}.db")
+
+    try:
+        if db_path.exists():
+            shutil.copy2(db_path, safety_copy)
+        shutil.copy2(source, db_path)
+    except OSError as ex:
+        try:
+            if safety_copy.exists():
+                shutil.copy2(safety_copy, db_path)
+        except OSError:
+            pass
+        return False, f"Restore failed: {ex}"
+
+    return True, f"Backup restored from {source.name}"
 
 
 def main(page: ft.Page) -> None:
@@ -1174,74 +1240,22 @@ def main(page: ft.Page) -> None:
         refresh_tasks()
         page.update()
 
-    def create_sqlite_backup(target_path: Path) -> None:
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(target_path) as backup_conn:
-            db.conn.backup(backup_conn)
-
-    def create_sqlite_backup_bytes() -> bytes:
-        with tempfile.NamedTemporaryFile(
-            prefix="betterself_backup_",
-            suffix=".db",
-            delete=False,
-        ) as tmp_file:
-            tmp_path = Path(tmp_file.name)
-        try:
-            create_sqlite_backup(tmp_path)
-            return tmp_path.read_bytes()
-        finally:
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-
-    def validate_backup_file(backup_path: Path) -> tuple[bool, str]:
-        if not backup_path.exists():
-            return False, "Selected file does not exist."
-
-        try:
-            with sqlite3.connect(backup_path) as conn:
-                rows = conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                ).fetchall()
-                table_names = {str(row[0]) for row in rows}
-        except sqlite3.Error:
-            return False, "Selected file is not a valid SQLite backup."
-
-        required = {"habits", "habit_checks", "tasks", "settings", "quotes"}
-        missing = sorted(required - table_names)
-        if missing:
-            return False, f"Backup missing required tables: {', '.join(missing)}."
-        return True, ""
-
     def restore_backup_from_path(path_value: str) -> tuple[bool, str]:
         nonlocal db
         source = Path(path_value.strip())
-        valid, reason = validate_backup_file(source)
-        if not valid:
-            return False, reason
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safety_copy = db_path.with_name(f"{db_path.stem}_before_restore_{timestamp}.db")
-
         try:
             db.conn.commit()
             db.conn.close()
-            if db_path.exists():
-                shutil.copy2(db_path, safety_copy)
-            shutil.copy2(source, db_path)
-            db = JournalDB(db_path)
-        except (OSError, sqlite3.Error) as ex:
-            try:
-                if safety_copy.exists():
-                    shutil.copy2(safety_copy, db_path)
-            except OSError:
-                pass
-            db = JournalDB(db_path)
-            return False, f"Restore failed: {ex}"
+        except sqlite3.Error:
+            pass
+
+        ok, msg = restore_backup_file_to_path(source, db_path)
+        db = JournalDB(db_path)
+        if not ok:
+            return False, msg
 
         refresh_all()
-        return True, f"Backup restored from {source.name}"
+        return True, msg
 
     def share_backup_file(path: Path) -> tuple[bool, str]:
         share_method = getattr(page, "share", None)
@@ -1326,7 +1340,7 @@ def main(page: ft.Page) -> None:
 
     async def create_backup_on_filesystem(_: ft.ControlEvent) -> None:
         try:
-            backup_bytes = create_sqlite_backup_bytes()
+            backup_bytes = create_sqlite_backup_bytes(db.conn)
         except (OSError, sqlite3.Error) as ex:
             show_settings_message(f"Failed to create backup: {ex}", False)
             page.update()
@@ -1351,7 +1365,7 @@ def main(page: ft.Page) -> None:
 
     async def create_and_share_backup(_: ft.ControlEvent) -> None:
         try:
-            backup_bytes = create_sqlite_backup_bytes()
+            backup_bytes = create_sqlite_backup_bytes(db.conn)
         except (OSError, sqlite3.Error) as ex:
             show_settings_message(f"Failed to create backup: {ex}", False)
             page.update()
