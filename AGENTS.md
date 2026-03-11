@@ -14,6 +14,12 @@ This file defines how AI coding agents should operate in this repository.
 - Run `ruff check .` and `pytest` after changes.
 - Log only user-experience-facing features into `UserStories.md`.
 
+## Versioning Policy
+- For new user-facing features, automatically bump the 3rd version component (patch), for example `0.1.3 -> 0.1.4`.
+- Do not bump the 2nd version component (minor) unless the user explicitly requests it in this chat.
+- If a change is internal-only (tooling, tests, refactor, infra) and not user-facing, do not change version by default.
+- When a version is bumped, update it in `pyproject.toml` and mention it in the change summary.
+
 ## UserStories Logging Scope
 - Include: new user-visible features, UX changes, behavior changes users can notice.
 - Exclude: dependency updates, tooling/lint/test setup, refactors, internal cleanup, infra-only changes.
